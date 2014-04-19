@@ -117,6 +117,14 @@ func NewApp() *cli.App {
 					BlockProfile: c.String("blockprofile"),
 				})
 			},
+		},
+		{
+			Name:  "newbucket",
+			Usage: "Creates a bucket on the database",
+			Action: func(c *cli.Context) {
+				path, name := c.Args().Get(0), c.Args().Get(1)
+				NewBucket(path, name)
+			},
 		}}
 	return app
 }
