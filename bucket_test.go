@@ -161,6 +161,64 @@ func TestBucket_Delete(t *testing.T) {
 	})
 }
 
+// Ensure that accessing and updating nested buckets is ok across transactions.
+func TestBucket_Nested(t *testing.T) {
+	withOpenDB(func(db *DB, path string) {
+		db.Update(func(tx *Tx) error {
+			// Create a widgets bucket.
+			b, err := tx.CreateBucket([]byte("widgets"))
+			assert.NoError(t, err)
+
+			// Create a widgets/foo bucket.
+			_, err = b.CreateBucket([]byte("foo"))
+			assert.NoError(t, err)
+
+			// Create a widgets/bar key.
+			assert.NoError(t, b.Put([]byte("bar"), []byte("0000")))
+
+			return nil
+		})
+		mustCheck(db)
+
+		// Update widgets/bar.
+		db.Update(func(tx *Tx) error {
+			var b = tx.Bucket([]byte("widgets"))
+			assert.NoError(t, b.Put([]byte("bar"), []byte("xxxx")))
+			return nil
+		})
+		mustCheck(db)
+
+		// Cause a split.
+		db.Update(func(tx *Tx) error {
+			var b = tx.Bucket([]byte("widgets"))
+			for i := 0; i < 10000; i++ {
+				assert.NoError(t, b.Put([]byte(strconv.Itoa(i)), []byte(strconv.Itoa(i))))
+			}
+			return nil
+		})
+		mustCheck(db)
+
+		// Insert into widgets/foo/baz.
+		db.Update(func(tx *Tx) error {
+			var b = tx.Bucket([]byte("widgets"))
+			assert.NoError(t, b.Bucket([]byte("foo")).Put([]byte("baz"), []byte("yyyy")))
+			return nil
+		})
+		mustCheck(db)
+
+		// Verify.
+		db.View(func(tx *Tx) error {
+			var b = tx.Bucket([]byte("widgets"))
+			assert.Equal(t, []byte("yyyy"), b.Bucket([]byte("foo")).Get([]byte("baz")))
+			assert.Equal(t, []byte("xxxx"), b.Get([]byte("bar")))
+			for i := 0; i < 10000; i++ {
+				assert.Equal(t, []byte(strconv.Itoa(i)), b.Get([]byte(strconv.Itoa(i))))
+			}
+			return nil
+		})
+	})
+}
+
 // Ensure that deleting a bucket using Delete() returns an error.
 func TestBucket_Delete_Bucket(t *testing.T) {
 	withOpenDB(func(db *DB, path string) {
@@ -473,7 +531,7 @@ func TestBucket_Put_KeyTooLarge(t *testing.T) {
 }
 
 // Ensure a bucket can calculate stats.
-func TestBucket_Stat(t *testing.T) {
+func TestBucket_Stats(t *testing.T) {
 	withOpenDB(func(db *DB, path string) {
 		db.Update(func(tx *Tx) error {
 			// Add bucket with fewer keys but one big value.
@@ -485,8 +543,37 @@ func TestBucket_Stat(t *testing.T) {
 			}
 			b.Put([]byte("really-big-value"), []byte(strings.Repeat("*", 10000)))
 
+			return nil
+		})
+		mustCheck(db)
+		db.View(func(tx *Tx) error {
+			b := tx.Bucket([]byte("woojits"))
+			stats := b.Stats()
+			assert.Equal(t, stats.BranchPageN, 1)
+			assert.Equal(t, stats.BranchOverflowN, 0)
+			assert.Equal(t, stats.LeafPageN, 6)
+			assert.Equal(t, stats.LeafOverflowN, 2)
+			assert.Equal(t, stats.KeyN, 501)
+			assert.Equal(t, stats.Depth, 2)
+			if os.Getpagesize() != 4096 {
+				// Incompatible page size
+				assert.Equal(t, stats.BranchInuse, 125)
+				assert.Equal(t, stats.BranchAlloc, 4096)
+				assert.Equal(t, stats.LeafInuse, 20908)
+				assert.Equal(t, stats.LeafAlloc, 32768)
+			}
+			return nil
+		})
+	})
+}
+
+// Ensure a bucket can calculate stats.
+func TestBucket_Stats_Small(t *testing.T) {
+
+	withOpenDB(func(db *DB, path string) {
+		db.Update(func(tx *Tx) error {
 			// Add a bucket that fits on a single root leaf.
-			b, err = tx.CreateBucket([]byte("whozawhats"))
+			b, err := tx.CreateBucket([]byte("whozawhats"))
 			assert.NoError(t, err)
 			b.Put([]byte("foo"), []byte("bar"))
 
@@ -494,52 +581,63 @@ func TestBucket_Stat(t *testing.T) {
 		})
 		mustCheck(db)
 		db.View(func(tx *Tx) error {
-			b := tx.Bucket([]byte("woojits"))
-			stat := b.Stat()
-			assert.Equal(t, stat.BranchPageCount, 1)
-			assert.Equal(t, stat.LeafPageCount, 6)
-			assert.Equal(t, stat.OverflowPageCount, 2)
-			assert.Equal(t, stat.KeyCount, 501)
-			assert.Equal(t, stat.MaxDepth, 2)
-
-			b = tx.Bucket([]byte("whozawhats"))
-			stat = b.Stat()
-			assert.Equal(t, stat.BranchPageCount, 0)
-			assert.Equal(t, stat.LeafPageCount, 1)
-			assert.Equal(t, stat.OverflowPageCount, 0)
-			assert.Equal(t, stat.KeyCount, 1)
-			assert.Equal(t, stat.MaxDepth, 1)
-
+			b := tx.Bucket([]byte("whozawhats"))
+			stats := b.Stats()
+			assert.Equal(t, stats.BranchPageN, 0)
+			assert.Equal(t, stats.BranchOverflowN, 0)
+			assert.Equal(t, stats.LeafPageN, 1)
+			assert.Equal(t, stats.LeafOverflowN, 0)
+			assert.Equal(t, stats.KeyN, 1)
+			assert.Equal(t, stats.Depth, 1)
+			if os.Getpagesize() != 4096 {
+				// Incompatible page size
+				assert.Equal(t, stats.BranchInuse, 0)
+				assert.Equal(t, stats.BranchAlloc, 0)
+				assert.Equal(t, stats.LeafInuse, 38)
+				assert.Equal(t, stats.LeafAlloc, 4096)
+			}
 			return nil
 		})
 	})
 }
 
 // Ensure a large bucket can calculate stats.
-func TestBucket_Stat_Large(t *testing.T) {
+func TestBucket_Stats_Large(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping test in short mode.")
 	}
 
 	withOpenDB(func(db *DB, path string) {
-		db.Update(func(tx *Tx) error {
-			// Add bucket with lots of keys.
-			tx.CreateBucket([]byte("widgets"))
-			b := tx.Bucket([]byte("widgets"))
-			for i := 0; i < 100000; i++ {
-				b.Put([]byte(strconv.Itoa(i)), []byte(strconv.Itoa(i)))
-			}
-			return nil
-		})
+		var index int
+		for i := 0; i < 1000; i++ {
+			db.Update(func(tx *Tx) error {
+				// Add bucket with lots of keys.
+				b, _ := tx.CreateBucketIfNotExists([]byte("widgets"))
+				for i := 0; i < 100; i++ {
+					b.Put([]byte(strconv.Itoa(index)), []byte(strconv.Itoa(index)))
+					index++
+				}
+				return nil
+			})
+		}
 		mustCheck(db)
+
 		db.View(func(tx *Tx) error {
 			b := tx.Bucket([]byte("widgets"))
-			stat := b.Stat()
-			assert.Equal(t, stat.BranchPageCount, 15)
-			assert.Equal(t, stat.LeafPageCount, 1281)
-			assert.Equal(t, stat.OverflowPageCount, 0)
-			assert.Equal(t, stat.KeyCount, 100000)
-			assert.Equal(t, stat.MaxDepth, 3)
+			stats := b.Stats()
+			assert.Equal(t, 19, stats.BranchPageN)
+			assert.Equal(t, 0, stats.BranchOverflowN)
+			assert.Equal(t, 1291, stats.LeafPageN)
+			assert.Equal(t, 0, stats.LeafOverflowN)
+			assert.Equal(t, 100000, stats.KeyN)
+			assert.Equal(t, 3, stats.Depth)
+			if os.Getpagesize() != 4096 {
+				// Incompatible page size
+				assert.Equal(t, 27289, stats.BranchInuse)
+				assert.Equal(t, 61440, stats.BranchAlloc)
+				assert.Equal(t, 2598276, stats.LeafInuse)
+				assert.Equal(t, 5246976, stats.LeafAlloc)
+			}
 			return nil
 		})
 	})
@@ -667,13 +765,12 @@ func TestBucket_Delete_Quick(t *testing.T) {
 				db.View(func(tx *Tx) error {
 					b := tx.Bucket([]byte("widgets"))
 					for j, exp := range items {
+						value := b.Get(exp.Key)
 						if j > i {
-							value := b.Get(exp.Key)
 							if !assert.Equal(t, exp.Value, value) {
 								t.FailNow()
 							}
 						} else {
-							value := b.Get(exp.Key)
 							if !assert.Nil(t, value) {
 								t.FailNow()
 							}
@@ -709,7 +806,7 @@ func ExampleBucket_Put() {
 	// Read value back in a different read-only transaction.
 	db.Update(func(tx *Tx) error {
 		value := tx.Bucket([]byte("widgets")).Get([]byte("foo"))
-		fmt.Printf("The value of 'foo' is: %s\n", string(value))
+		fmt.Printf("The value of 'foo' is: %s\n", value)
 		return nil
 	})
 
@@ -734,7 +831,7 @@ func ExampleBucket_Delete() {
 
 		// Retrieve the key back from the database and verify it.
 		value := b.Get([]byte("foo"))
-		fmt.Printf("The value of 'foo' was: %s\n", string(value))
+		fmt.Printf("The value of 'foo' was: %s\n", value)
 		return nil
 	})
 
@@ -773,7 +870,7 @@ func ExampleBucket_ForEach() {
 
 		// Iterate over items in sorted key order.
 		b.ForEach(func(k, v []byte) error {
-			fmt.Printf("A %s is %s.\n", string(k), string(v))
+			fmt.Printf("A %s is %s.\n", k, v)
 			return nil
 		})
 		return nil

@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -22,6 +24,13 @@ var benchBucketName = []byte("bench")
 func Bench(options *BenchOptions) {
 	var results BenchResults
 
+	// Validate options.
+	if options.BatchSize == 0 {
+		options.BatchSize = options.Iterations
+	} else if options.Iterations%options.BatchSize != 0 {
+		fatal("number of iterations must be divisible by the batch size")
+	}
+
 	// Find temporary location.
 	path := tempfile()
 	defer os.Remove(path)
@@ -33,6 +42,11 @@ func Bench(options *BenchOptions) {
 		return
 	}
 	defer db.Close()
+
+	// Enable streaming stats.
+	if options.StatsInterval > 0 {
+		go printStats(db, options.StatsInterval)
+	}
 
 	// Start profiling for writes.
 	if options.ProfileMode == "rw" || options.ProfileMode == "w" {
@@ -65,9 +79,9 @@ func Bench(options *BenchOptions) {
 	}
 
 	// Print results.
-	fmt.Printf("# Write\t%v\t(%v/op)\t(%v op/sec)\n", results.WriteDuration, results.WriteOpDuration(), results.WriteOpsPerSecond())
-	fmt.Printf("# Read\t%v\t(%v/op)\t(%v op/sec)\n", results.ReadDuration, results.ReadOpDuration(), results.ReadOpsPerSecond())
-	fmt.Println("")
+	fmt.Fprintf(os.Stderr, "# Write\t%v\t(%v/op)\t(%v op/sec)\n", results.WriteDuration, results.WriteOpDuration(), results.WriteOpsPerSecond())
+	fmt.Fprintf(os.Stderr, "# Read\t%v\t(%v/op)\t(%v op/sec)\n", results.ReadDuration, results.ReadOpDuration(), results.ReadOpsPerSecond())
+	fmt.Fprintln(os.Stderr, "")
 }
 
 // Writes to the database.
@@ -78,6 +92,8 @@ func benchWrite(db *bolt.DB, options *BenchOptions, results *BenchResults) error
 	switch options.WriteMode {
 	case "seq":
 		err = benchWriteSequential(db, options, results)
+	case "rnd":
+		err = benchWriteRandom(db, options, results)
 	default:
 		return fmt.Errorf("invalid write mode: %s", options.WriteMode)
 	}
@@ -88,22 +104,38 @@ func benchWrite(db *bolt.DB, options *BenchOptions, results *BenchResults) error
 }
 
 func benchWriteSequential(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+	var i = uint32(0)
+	return benchWriteWithSource(db, options, results, func() uint32 { i++; return i })
+}
+
+func benchWriteRandom(db *bolt.DB, options *BenchOptions, results *BenchResults) error {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return benchWriteWithSource(db, options, results, func() uint32 { return r.Uint32() })
+}
+
+func benchWriteWithSource(db *bolt.DB, options *BenchOptions, results *BenchResults, keySource func() uint32) error {
 	results.WriteOps = options.Iterations
 
-	return db.Update(func(tx *bolt.Tx) error {
-		b, _ := tx.CreateBucketIfNotExists(benchBucketName)
+	for i := 0; i < options.Iterations; i += options.BatchSize {
+		err := db.Update(func(tx *bolt.Tx) error {
+			b, _ := tx.CreateBucketIfNotExists(benchBucketName)
 
-		for i := 0; i < options.Iterations; i++ {
-			var key = make([]byte, options.KeySize)
-			var value = make([]byte, options.ValueSize)
-			binary.BigEndian.PutUint32(key, uint32(i))
-			if err := b.Put(key, value); err != nil {
-				return err
+			for j := 0; j < options.BatchSize; j++ {
+				var key = make([]byte, options.KeySize)
+				var value = make([]byte, options.ValueSize)
+				binary.BigEndian.PutUint32(key, keySource())
+				if err := b.Put(key, value); err != nil {
+					return err
+				}
 			}
-		}
 
-		return nil
-	})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Reads from the database.
@@ -137,7 +169,7 @@ func benchReadSequential(db *bolt.DB, options *BenchOptions, results *BenchResul
 				count++
 			}
 
-			if count != options.Iterations {
+			if options.WriteMode == "seq" && count != options.Iterations {
 				return fmt.Errorf("read seq: iter mismatch: expected %d, got %d", options.Iterations, count)
 			}
 
@@ -207,17 +239,42 @@ func benchStopProfiling() {
 	}
 }
 
+// Continuously prints stats on the database at given intervals.
+func printStats(db *bolt.DB, interval time.Duration) {
+	var prevStats = db.Stats()
+	var encoder = json.NewEncoder(os.Stdout)
+
+	for {
+		// Wait for the stats interval.
+		time.Sleep(interval)
+
+		// Retrieve new stats and find difference from previous iteration.
+		var stats = db.Stats()
+		var diff = stats.Sub(&prevStats)
+
+		// Print as JSON to STDOUT.
+		if err := encoder.Encode(diff); err != nil {
+			fatal(err)
+		}
+
+		// Save stats for next iteration.
+		prevStats = stats
+	}
+}
+
 // BenchOptions represents the set of options that can be passed to Bench().
 type BenchOptions struct {
-	ProfileMode  string
-	WriteMode    string
-	ReadMode     string
-	Iterations   int
-	KeySize      int
-	ValueSize    int
-	CPUProfile   string
-	MemProfile   string
-	BlockProfile string
+	ProfileMode   string
+	WriteMode     string
+	ReadMode      string
+	Iterations    int
+	BatchSize     int
+	KeySize       int
+	ValueSize     int
+	CPUProfile    string
+	MemProfile    string
+	BlockProfile  string
+	StatsInterval time.Duration
 }
 
 // BenchResults represents the performance results of the benchmark.

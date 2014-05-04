@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sort"
 	"unsafe"
 )
 
@@ -41,10 +40,10 @@ var (
 // Bucket represents a collection of key/value pairs inside the database.
 type Bucket struct {
 	*bucket
-	tx      *Tx
-	buckets map[string]*Bucket
-	nodes   map[pgid]*node
-	pending []*node
+	tx       *Tx
+	buckets  map[string]*Bucket
+	rootNode *node
+	nodes    map[pgid]*node
 }
 
 // bucket represents the on-file representation of a bucket.
@@ -61,6 +60,16 @@ func newBucket(tx *Tx) Bucket {
 		b.nodes = make(map[pgid]*node)
 	}
 	return b
+}
+
+// Tx returns the tx of the bucket.
+func (b *Bucket) Tx() *Tx {
+	return b.tx
+}
+
+// Root returns the root of the bucket.
+func (b *Bucket) Root() pgid {
+	return b.root
 }
 
 // Writable returns whether the bucket is writable.
@@ -144,6 +153,7 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	bucket.root = p.id
 
 	// Insert into node.
+	key = cloneBytes(key)
 	c.node().put(key, key, value, 0, bucketLeafFlag)
 
 	return b.Bucket(key), nil
@@ -252,6 +262,7 @@ func (b *Bucket) Put(key []byte, value []byte) error {
 	}
 
 	// Insert into node.
+	key = cloneBytes(key)
 	c.node().put(key, key, value, 0, 0)
 
 	return nil
@@ -319,22 +330,33 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 }
 
 // Stat returns stats on a bucket.
-func (b *Bucket) Stat() *BucketStat {
-	s := &BucketStat{}
+func (b *Bucket) Stats() BucketStats {
+	var s BucketStats
+	pageSize := b.tx.db.pageSize
 	b.tx.forEachPage(b.root, 0, func(p *page, depth int) {
 		if (p.flags & leafPageFlag) != 0 {
-			s.LeafPageCount++
-			s.KeyCount += int(p.count)
+			s.LeafPageN++
+			s.KeyN += int(p.count)
+			lastElement := p.leafPageElement(p.count - 1)
+			used := pageHeaderSize + (leafPageElementSize * int(p.count-1))
+			used += int(lastElement.pos + lastElement.ksize + lastElement.vsize)
+			s.LeafInuse += used
+			s.LeafOverflowN += int(p.overflow)
 		} else if (p.flags & branchPageFlag) != 0 {
-			s.BranchPageCount++
+			s.BranchPageN++
+			lastElement := p.branchPageElement(p.count - 1)
+			used := pageHeaderSize + (branchPageElementSize * int(p.count-1))
+			used += int(lastElement.pos + lastElement.ksize)
+			s.BranchInuse += used
+			s.BranchOverflowN += int(p.overflow)
 		}
 
-		s.OverflowPageCount += int(p.overflow)
-
-		if depth+1 > s.MaxDepth {
-			s.MaxDepth = (depth + 1)
+		if depth+1 > s.Depth {
+			s.Depth = (depth + 1)
 		}
 	})
+	s.BranchAlloc = (s.BranchPageN + s.BranchOverflowN) * pageSize
+	s.LeafAlloc = (s.LeafPageN + s.LeafOverflowN) * pageSize
 	return s
 }
 
@@ -359,76 +381,19 @@ func (b *Bucket) spill() error {
 		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
 	}
 
-	// Ignore if there are no nodes to spill.
-	if len(b.nodes) == 0 {
+	// Ignore if there's not a materialized root node.
+	if b.rootNode == nil {
 		return nil
 	}
 
-	// Sort nodes by highest depth first.
-	nodes := make(nodesByDepth, 0, len(b.nodes))
-	for _, n := range b.nodes {
-		nodes = append(nodes, n)
+	// Spill nodes.
+	if err := b.rootNode.spill(); err != nil {
+		return err
 	}
-	sort.Sort(nodes)
-
-	// Spill nodes by deepest first.
-	for i := 0; i < len(nodes); i++ {
-		n := nodes[i]
-
-		// Split nodes into appropriate sized nodes.
-		// The first node in this list will be a reference to n to preserve ancestry.
-		newNodes := n.split(b.tx.db.pageSize)
-		b.pending = newNodes
-
-		// If this is a root node that split then create a parent node.
-		if n.parent == nil && len(newNodes) > 1 {
-			n.parent = &node{bucket: b, isLeaf: false}
-			nodes = append(nodes, n.parent)
-		}
-
-		// Add node's page to the freelist.
-		if n.pgid > 0 {
-			b.tx.db.freelist.free(b.tx.id(), b.tx.page(n.pgid))
-		}
-
-		// Write nodes to dirty pages.
-		for i, newNode := range newNodes {
-			// Allocate contiguous space for the node.
-			p, err := b.tx.allocate((newNode.size() / b.tx.db.pageSize) + 1)
-			if err != nil {
-				return err
-			}
-
-			// Write the node to the page.
-			newNode.write(p)
-			newNode.pgid = p.id
-			newNode.parent = n.parent
-
-			// The first node should use the existing entry, other nodes are inserts.
-			var oldKey []byte
-			if i == 0 {
-				oldKey = n.key
-			} else {
-				oldKey = newNode.inodes[0].key
-			}
-
-			// Update the parent entry.
-			if newNode.parent != nil {
-				newNode.parent.put(oldKey, newNode.inodes[0].key, nil, newNode.pgid, 0)
-			}
-
-			// Update the statistics.
-			b.tx.stats.Spill++
-		}
-
-		b.pending = nil
-	}
-
-	// Clear out nodes now that they are all spilled.
-	b.nodes = make(map[pgid]*node)
+	b.rootNode = b.rootNode.root()
 
 	// Update the root node for this bucket.
-	b.root = nodes[len(nodes)-1].pgid
+	b.root = b.rootNode.pgid
 
 	return nil
 }
@@ -451,10 +416,12 @@ func (b *Bucket) node(pgid pgid, parent *node) *node {
 		return n
 	}
 
-	// Otherwise create a branch and cache it.
+	// Otherwise create a branch node and cache it.
 	n := &node{bucket: b, parent: parent}
-	if n.parent != nil {
-		n.depth = n.parent.depth + 1
+	if parent == nil {
+		b.rootNode = n
+	} else {
+		parent.children = append(parent.children, n)
 	}
 	n.read(b.tx.page(pgid))
 	b.nodes[pgid] = n
@@ -471,16 +438,12 @@ func (b *Bucket) dereference() {
 		n.dereference()
 	}
 
-	for _, n := range b.pending {
-		n.dereference()
-	}
-
 	for _, child := range b.buckets {
 		child.dereference()
 	}
 
 	// Update statistics
-	b.tx.stats.NodeDeref += len(b.nodes) + len(b.pending)
+	b.tx.stats.NodeDeref += len(b.nodes)
 }
 
 // pageNode returns the in-memory node, if it exists.
@@ -494,11 +457,28 @@ func (b *Bucket) pageNode(id pgid) (*page, *node) {
 	return b.tx.page(id), nil
 }
 
-// BucketStat represents stats on a bucket such as branch pages and leaf pages.
-type BucketStat struct {
-	BranchPageCount   int
-	LeafPageCount     int
-	OverflowPageCount int
-	KeyCount          int
-	MaxDepth          int
+// BucketStats records statistics about resources used by a bucket.
+type BucketStats struct {
+	// Page count statistics.
+	BranchPageN     int // number of logical branch pages
+	BranchOverflowN int // number of physical branch overflow pages
+	LeafPageN       int // number of logical leaf pages
+	LeafOverflowN   int // number of physical leaf overflow pages
+
+	// Tree statistics.
+	KeyN  int // number of keys/value pairs
+	Depth int // number of levels in B+tree
+
+	// Page size utilization.
+	BranchAlloc int // bytes allocated for physical branch pages
+	BranchInuse int // bytes actually used for branch data
+	LeafAlloc   int // bytes allocated for physical leaf pages
+	LeafInuse   int // bytes actually used for leaf data
+}
+
+// cloneBytes returns a copy of a given slice.
+func cloneBytes(v []byte) []byte {
+	var clone = make([]byte, len(v))
+	copy(clone, v)
+	return clone
 }
